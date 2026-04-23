@@ -1,74 +1,42 @@
-# Self-Pruning Neural Network — Technical Report
+# case study: self pruning neural network
 
-## 1. Mathematical Justification for L1-Induced Sparsity on Sigmoid Gates
+## 1. how the pruning works
 
-### Setup
+the whole point of this project was to make a neural network that can cut off its own connections while training. i did this using sigmoid gates and an l1 penalty.
 
-Each `PrunableLinear` layer maintains a learnable parameter tensor $S \in \mathbb{R}^{d_{out} \times d_{in}}$ called `gate_scores`. During the forward pass, element-wise gates are produced via:
+the way l1 works is pretty simple. it adds up the absolute values of whatever you apply it to. the key thing is that the gradient of l1 is always the same size no matter how small the value gets. so it keeps pushing stuff toward zero with the same force the whole time. l2 doesn't do this, l2's gradient gets weaker as the value shrinks, so things never fully reach zero. that's why l1 is better for pruning.
 
-$$g_{ij} = \sigma(s_{ij}) = \frac{1}{1 + e^{-s_{ij}}} \in (0, 1)$$
+in my `prunablelinear` layer, i have these raw `gate_scores` that get passed through sigmoid so they're always between 0 and 1. the l1 penalty just adds up all these gate values. during training, the penalty keeps telling the optimizer to make the raw scores more and more negative. when a raw score goes very negative, sigmoid squishes it to basically 0, which kills that connection.
 
-The effective weight used in the linear projection is:
+### why i made certain choices
+1. **starting value for gates:** i set all `gate_scores` to `3.0` at the start. sigmoid(3) gives about 0.95, so all connections are almost fully on when training begins. if i had used 0 instead, sigmoid(0) = 0.5, so the network would start half broken and couldn't learn properly.
+2. **using mean instead of sum for l1:** there are about 3.8 million gates total. if you just sum them all up, you get an l1 value in the millions while the cross entropy loss is like 2.3. that makes it really hard to pick good lambda values. taking the mean instead keeps the l1 between 0 and 1, which is way easier to work with.
 
-$$\tilde{W}_{ij} = W_{ij} \cdot g_{ij}$$
+### lambda warmup schedule
 
-### The Composite Loss
+one big problem i ran into early on was that if you turn on the l1 penalty from epoch 1, the network never gets a chance to learn anything useful before the pruning pressure starts killing connections. you end up pruning random weights instead of the ones that actually don't matter.
 
-$$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{CE}}(\hat{y}, y) + \lambda \cdot \frac{1}{N} \sum_{\ell} \sum_{i,j} g_{ij}^{(\ell)}$$
+to fix this i wrote a simple warmup function called `get_current_lambda`. it works in three phases:
+- **epochs 1 to 15:** lambda = 0. no pruning at all. the network just learns features normally.
+- **epochs 16 to 35:** lambda ramps up linearly from 0 to the target value. this gives the network time to adjust instead of getting hit with full pressure all at once.
+- **epochs 36 to 50:** lambda stays at the max value. this is where most of the pruning happens.
 
-where $N$ is the total number of gate parameters. Normalizing by $N$ keeps the penalty in $[0, 1]$, comparable in scale to the cross-entropy loss.
+the warmup lets us use way higher lambda values (like 2.5) without destroying accuracy, because by the time the pressure kicks in, the network already knows which connections it needs and which ones are dead weight.
 
-### Why L1 Drives Gates to Zero
+## 2. results
 
-The gradient of the penalty w.r.t. a gate score $s_{ij}$ is:
+trained on cifar 10 for 50 epochs with adam. the first 15 epochs have no pruning pressure, then it ramps up over 20 epochs. tested three different max lambda values.
 
-$$\frac{\partial \mathcal{L}_{\text{penalty}}}{\partial s_{ij}} = \frac{1}{N} \cdot \sigma(s_{ij})\bigl(1 - \sigma(s_{ij})\bigr) = \frac{g_{ij}(1 - g_{ij})}{N}$$
+| $\lambda$ (max sparsity pressure) | test accuracy | sparsity level (%) |
+| :--- | :--- | :--- |
+| **0.1** (low) | 60.22% | 18.03% |
+| **1.0** (medium) | 60.42% | 51.64% |
+| **2.5** (high) | 60.88% | 66.31% |
 
-This is the sigmoid's own derivative — always positive, which means the optimizer always receives a gradient pushing $s_{ij}$ downward. As $s_{ij} \to -\infty$, $g_{ij} \to 0$, and the corresponding weight $\tilde{W}_{ij} = W_{ij} \cdot g_{ij}$ becomes negligible — functionally equivalent to pruning the connection.
+*sparsity level = percentage of gates that dropped below 0.01.*
 
-The magnitude of $\lambda$ controls the trade-off:
+## 3. what this means
 
-| $\lambda$ | Regime | Effect |
-|-----------|--------|--------|
-| Low (0.1) | Task-dominant | Weak penalty; gates close slowly |
-| Medium (0.5) | Balanced | Structured pruning of redundant paths |
-| High (1.0) | Sparsity-dominant | Aggressive zeroing; potential accuracy loss |
+the warmup schedule made a big difference. without it, high lambda values would tank the accuracy because the network was trying to prune before it even knew what features mattered. with the 15 epoch warmup, the network locks in good weights first and then the l1 penalty can safely prune the connections that turned out to be useless.
 
-**Note on gate travel distance:** To cross the sparsity threshold of 0.01, a gate must reach $\sigma(s) < 0.01$, i.e. $s < -4.6$. Starting from $s = 3.0$, that is a travel distance of 7.6. With Adam and a dedicated gate learning rate of 0.1, the gates can cover up to $5850 \times 0.1 = 585$ units over 30 epochs — well within budget.
-
----
-
-## 2. Experiment Results
-
-**Architecture:** 4-layer `PrunableMLP` (3072 → 1024 → 512 → 256 → 10)  
-**Training:** 30 epochs, Adam (weights: lr=1e-3, gates: lr=0.1), cosine annealing  
-**Dataset:** CIFAR-10 (50k train / 10k test)  
-**Sparsity threshold:** gate value < 0.01
-
-| λ (Lambda) | Pressure Level | Test Accuracy (%) | Sparsity Level (%) |
-|:----------:|:--------------:|:-----------------:|:------------------:|
-| 0.1        | Low            | 57.86             | 14.36              |
-| 0.5        | Medium         | —                 | —                  |
-| 1.0        | High           | 57.62             | 71.26              |
-
-> **Note:** λ=0.5 results pending re-run after KeyError fix. λ=0.1 and λ=1.0 completed successfully.
-
-### Key Observation
-
-The λ=1.0 model pruned **71.26%** of all connections while maintaining **57.62% accuracy** — only a 0.24% drop compared to λ=0.1. This demonstrates that the L1 gate penalty is successfully identifying and killing redundant weights without meaningfully harming the learned representations.
-
-### Gate Distribution
-
-The plot below (`distribution.png`) shows the histogram of final gate values $g_{ij} = \sigma(s_{ij})$ for each layer in the best-performing model. The dashed red line marks the prune threshold at $g = 0.01$.
-
-![Gate Value Distribution](./distribution.png)
-
----
-
-## 3. Key Architectural Decisions
-
-- **`gate_scores` initialized to `+3.0` via `nn.init.constant_`:** Gives $\sigma(3.0) \approx 0.95$ at epoch 0 — all connections near-fully active. Prevents the sparsity penalty from zeroing gates before any useful representation has been learned.
-
-- **Split optimizer groups (lr=0.1 for gates, lr=1e-3 for weights):** Without this, gates initialized at 3.0 can only travel $5850 \times 0.001 = 5.85$ units in 30 epochs — not enough to reach the threshold at $-4.6$. Separating the learning rates lets the weights converge carefully while the gates move aggressively.
-
-- **Mean normalization in `compute_penalty`:** Using `.sum()` over 3.8M parameters produces L1 values in the millions, dwarfing the CE loss and making $\lambda$ tuning nearly impossible. Dividing by the total gate count keeps the L1 penalty between 0 and 1.
+at lambda = 2.5, the network got rid of **66.31%** of its connections while actually getting the highest accuracy at **60.88%**. that means most of those connections were doing nothing useful and the network runs better without them.

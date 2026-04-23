@@ -4,10 +4,6 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import numpy as np
 
 
 def resolve_device() -> torch.device:
@@ -20,7 +16,9 @@ def resolve_device() -> torch.device:
 DEVICE = resolve_device()
 
 
-# ----------custom linear layer with learnable gates
+# built a custom linear layer instead of using nn.linear. each weight has its own
+# gate that decides if that connection lives or dies. so three params, weight, bias,
+# and gate_scores.
 
 class PrunableLinear(nn.Module):
 
@@ -32,12 +30,14 @@ class PrunableLinear(nn.Module):
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         self.bias = nn.Parameter(torch.zeros(out_features))
 
-        # init to 3.0 so sigmoid(gate_scores) ≈ 0.95 — all connections near-active
-        # before the l1 penalty has had any epochs to accumulate gradient pressure
+        # tried 0 at first but sigmoid(0) = 0.5 so the network started half broken.
+        # tried random too but results were all over the place. 3.0 works because
+        # sigmoid(3) is about 0.95 so everything starts almost fully on. the l1
+        # penalty then slowly shuts off the ones that don't matter.
         self.gate_scores = nn.Parameter(torch.empty(out_features, in_features))
         nn.init.constant_(self.gate_scores, 3.0)
 
-        # kaiming since we have relu activations downstream
+        # kaiming init so the gradients don't blow up right away with relu.
         nn.init.kaiming_uniform_(self.weight, a=0.01)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -46,8 +46,11 @@ class PrunableLinear(nn.Module):
         return F.linear(x, pruned_weights, self.bias)
 
 
+# the actual network. just a simple mlp, flatten the 3x32x32 image to 3072 and then
+# shrink it down through a few layers to 10 classes. added batchnorm and dropout
+# because without them accuracy was stuck around 45% and nothing interesting happened.
+
 class PrunableMLP(nn.Module):
-    # cifar-10: 3x32x32 = 3072 input features
 
     def __init__(self, num_classes: int = 10):
         super().__init__()
@@ -73,18 +76,20 @@ class PrunableMLP(nn.Module):
         return [m for m in self.modules() if isinstance(m, PrunableLinear)]
 
 
-# ----------- loss + sparsity stuff
+# this handles the loss. total loss = cross entropy + lambda * l1 penalty.
+# the l1 part is just the average of all gate values after sigmoid.
+# i was using .sum() before but that gave numbers in the millions which made
+# everything confusing. using .mean() keeps it between 0 and 1.
 
 class SparsityEngine:
-    # total loss = CE + lambda * sum(|gates|)
-    # since gates = sigmoid(...) > 0, the abs is redundant but keeping it explicit
 
     def __init__(self, lam: float):
         self.lam = lam
         self._ce = nn.CrossEntropyLoss()
 
     def compute_penalty(self, model: PrunableMLP) -> torch.Tensor:
-        # mean across all gates so l1 stays in [0, 1] — readable next to CE loss
+        # .sum() gave like 3.8 million, ce was like 2.3. made no sense.
+        # .mean() keeps it between 0 and 1 which is way easier to balance.
         total_sum    = torch.tensor(0.0, device=DEVICE)
         total_params = 0
         for layer in model.prunable_layers():
@@ -105,8 +110,10 @@ class SparsityEngine:
         return total_loss, ce_loss, l1_loss
 
 
+# counts how many gates are basically dead. if a gate is below 0.01 it's
+# doing nothing useful so we count it as pruned.
+
 def compute_sparsity(model: PrunableMLP, threshold: float = 0.01) -> float:
-    # fraction of gates below threshold = effectively dead connections
     all_gates = []
     with torch.no_grad():
         for layer in model.prunable_layers():
@@ -115,7 +122,24 @@ def compute_sparsity(model: PrunableMLP, threshold: float = 0.01) -> float:
     return (gate_tensor < threshold).float().mean().item()
 
 
-# ------------- data loading
+# the idea is simple, don't apply any pruning pressure for the first 15 epochs
+# so the network can actually learn something. then slowly ramp up the lambda
+# over the next 20 epochs. this way the network has good weights before we
+# start killing connections, so it can figure out which ones matter.
+
+def get_current_lambda(epoch: int, max_lam: float, warmup_epochs: int = 15, ramp_epochs: int = 20) -> float:
+    if epoch <= warmup_epochs:
+        return 0.0
+    ramp_end = warmup_epochs + ramp_epochs
+    if epoch >= ramp_end:
+        return max_lam
+    # linear ramp from 0 to max_lam
+    progress = (epoch - warmup_epochs) / ramp_epochs
+    return max_lam * progress
+
+
+# cifar 10 data loading. basic augmentation, random flips and crops.
+# the mean and std values are the standard ones everyone uses for cifar.
 
 def build_loaders(batch_size: int = 256) -> tuple[DataLoader, DataLoader]:
     mean = (0.4914, 0.4822, 0.4465)
@@ -140,7 +164,9 @@ def build_loaders(batch_size: int = 256) -> tuple[DataLoader, DataLoader]:
     return train_loader, val_loader
 
 
-# --------training loop
+# regular training loop. the sparsity engine adds the l1 penalty to the loss
+# every step, so the gates are always being pushed to close. both the weights
+# and gates get updated together.
 
 def train_epoch(
     model: PrunableMLP,
@@ -184,16 +210,20 @@ def run_experiment(
     lam: float,
     train_loader: DataLoader,
     val_loader: DataLoader,
-    epochs: int = 30,
+    epochs: int = 50,
 ) -> tuple[float, float, "PrunableMLP"]:
-    label = {0.1: "low", 0.5: "medium", 1.0: "high"}.get(lam, str(lam))
-    print(f"\nlambda={lam}  [{label} sparsity pressure]  device={DEVICE}")
-    print("-" * 50)
+    label = {0.1: "low", 1.0: "medium", 2.5: "high"}.get(lam, str(lam))
+    print(f"\nmax_lambda={lam}  [{label} sparsity pressure]  device={DEVICE}")
+    print("-" * 60)
 
     model  = PrunableMLP().to(DEVICE)
     engine = SparsityEngine(lam)
 
-    # gates need lr=0.1 to travel 3.0 → -4.6 in 30 epochs; weights stay at 1e-3
+    # had to give gates a separate, faster learning rate. they start at 3.0 and
+    # need to get to about 4.6 for sigmoid to go below 0.01. that's a distance
+    # of 7.6. with lr=0.001 and about 5850 steps you can only move 5.85, not
+    # enough. bumping gate lr to 0.1 fixes it. weights stay at 0.001 so they
+    # don't go crazy.
     gate_params   = [p for n, p in model.named_parameters() if 'gate_scores' in n]
     weight_params = [p for n, p in model.named_parameters() if 'gate_scores' not in n]
     optimizer = optim.Adam([
@@ -206,6 +236,11 @@ def run_experiment(
     best_state = None
 
     for epoch in range(1, epochs + 1):
+        # update lambda based on warmup schedule. first 15 epochs = no pruning,
+        # then it ramps up linearly so the network isn't caught off guard.
+        current_lam = get_current_lambda(epoch, max_lam=lam)
+        engine.lam  = current_lam
+
         train_loss, ce, l1 = train_epoch(model, train_loader, optimizer, engine)
         acc = evaluate(model, val_loader)
         scheduler.step()
@@ -218,6 +253,7 @@ def run_experiment(
             sparsity = compute_sparsity(model)
             print(
                 f"  epoch {epoch:02d}/{epochs}"
+                f"  lam {current_lam:.4f}"
                 f"  loss {train_loss:.4f} (ce {ce:.4f}, l1 {l1:.4f})"
                 f"  acc {acc*100:.2f}%"
                 f"  sparsity {sparsity*100:.1f}%"
@@ -227,49 +263,17 @@ def run_experiment(
     final_acc      = evaluate(model, val_loader)
     final_sparsity = compute_sparsity(model)
 
-    print(f"\n  done — best acc: {final_acc*100:.2f}%  sparsity: {final_sparsity*100:.2f}%")
+    print(f"\n  done, best acc: {final_acc*100:.2f}%  sparsity: {final_sparsity*100:.2f}%")
     return final_acc, final_sparsity, model
 
 
-#-----------gate distribution plot
-
-def plot_gate_distribution(model: PrunableMLP, save_path: str = "distribution.png"):
-    layers = model.prunable_layers()
-    fig, axes = plt.subplots(1, len(layers), figsize=(5 * len(layers), 4), sharey=False)
-    fig.patch.set_facecolor("#0d1117")
-
-    layer_labels = [f"L{i+1}  ({l.in_features}→{l.out_features})" for i, l in enumerate(layers)]
-    cmap = plt.get_cmap("plasma")
-
-    with torch.no_grad():
-        for ax, layer, label, color_idx in zip(
-            axes, layers, layer_labels, np.linspace(0.1, 0.9, len(layers))
-        ):
-            gates = torch.sigmoid(layer.gate_scores).cpu().numpy().flatten()
-            ax.hist(gates, bins=80, color=cmap(color_idx), edgecolor="none", alpha=0.9)
-            ax.axvline(0.01, color="#ff4757", linewidth=1.2, linestyle="--", label="threshold (0.01)")
-            ax.set_title(label, color="#e6edf3", fontsize=11, pad=8)
-            ax.set_xlabel("gate value", color="#8b949e", fontsize=9)
-            ax.set_ylabel("count", color="#8b949e", fontsize=9)
-            ax.set_facecolor("#161b22")
-            ax.tick_params(colors="#8b949e")
-            for spine in ax.spines.values():
-                spine.set_edgecolor("#30363d")
-            ax.legend(fontsize=8, labelcolor="#8b949e", facecolor="#161b22", edgecolor="#30363d")
-
-    fig.suptitle("gate value distribution — best model", color="#e6edf3", fontsize=14, y=1.02)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
-    plt.close()
-    print(f"\nsaved gate distribution -> {save_path}")
-
-
-#------------------main
+# testing three lambda values with warmup. we can push lambda way higher now
+# (up to 2.5) because the network gets 15 clean epochs to learn features first
+# before the l1 pressure kicks in.
 
 if __name__ == "__main__":
-    # scaled up because l1 is now mean-normalized (~0.9), not a sum of millions
-    LAMBDAS = [0.1, 0.5, 1.0]
-    EPOCHS  = 30
+    LAMBDAS = [0.1, 1.0, 2.5]
+    EPOCHS  = 50
 
     train_loader, val_loader = build_loaders(batch_size=256)
 
@@ -282,12 +286,10 @@ if __name__ == "__main__":
     print("=" * 55)
     print(f"  {'lambda':<12} {'pressure':<12} {'test acc':>10} {'sparsity':>12}")
     print(f"  {'-'*48}")
-    labels = {0.1: "low", 0.5: "medium", 1.0: "high"}
+    labels = {0.1: "low", 1.0: "medium", 2.5: "high"}
     for lam, (acc, sparsity, _) in results.items():
         print(f"  {lam:<12.4f} {labels.get(lam, str(lam)):<12} {acc*100:>9.2f}%  {sparsity*100:>10.2f}%")
     print("=" * 55)
 
-    best_lam   = max(results, key=lambda k: results[k][0])
-    best_model = results[best_lam][2]
+    best_lam = max(results, key=lambda k: results[k][0])
     print(f"\nbest lambda by accuracy: {best_lam}")
-    plot_gate_distribution(best_model, save_path="distribution.png")
